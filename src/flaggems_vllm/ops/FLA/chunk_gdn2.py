@@ -24,13 +24,8 @@ from flaggems_vllm.ops.FLA.index import prepare_chunk_indices,prepare_chunk_offs
 
 from flaggems_vllm.ops.FLA.triton_ops_helper import autotune_cache_kwargs
 
-#原生triton实现的所需函数
-from flaggems_vllm.ops.FLA.chunk_delta_h import chunk_gated_delta_rule_fwd_h 
-from flaggems_vllm.ops.FLA.cumsum import BS_LIST, chunk_local_cumsum 
-from flaggems_vllm.ops.FLA.chunk_gla import chunk_gla_fwd_o_gk 
-from flaggems_vllm.ops.FLA.chunk_gdn2_intra import chunk_gdn2_fwd_intra 
-#flag没有,需要增加的
-RCP_LN2 = 1.4426950216
+from .gdn2_native.chunk_fwd import chunk_gdn2_fwd
+
 
 if has_triton_tle(3, 6, 0):
     try:
@@ -86,242 +81,8 @@ def softplus_nv(x):
         is_pure=True,
     )
 softplus=softplus_nv
-#增加kda_gate_chunk_cumsum
-@triton.heuristics({
-    "HAS_BIAS": lambda args: args["dt_bias"] is not None,
-    'HAS_SCALE': lambda args: args['scale'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-    'USE_LOWER_BOUND': lambda args: args['lower_bound'] is not None,
-})
-@triton.autotune(
-    configs=[
-        triton.Config({'BS': BS}, num_warps=num_warps)
-        for BS in BS_LIST
-        for num_warps in [2, 4, 8]
-    ],
-    key=['H', 'S', 'BT', 'IS_VARLEN', 'REVERSE'],
-    **autotune_cache_kwargs,
-)
-@triton.jit(do_not_specialize=['T'])
-def kda_gate_chunk_cumsum_vector_kernel(
-    s,
-    A_log,
-    dt_bias,
-    o,
-    scale,
-    cu_seqlens,
-    chunk_indices,
-    lower_bound,
-    T,
-    H: tl.constexpr,
-    S: tl.constexpr,
-    BT: tl.constexpr,
-    BS: tl.constexpr,
-    REVERSE: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    HAS_SCALE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    USE_LOWER_BOUND: tl.constexpr,
-):
-    i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_b, i_h = i_bh // H, i_bh % H
-    if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-        T = eos - bos
-    else:
-        bos, eos = i_b * T, i_b * T + T
-
-    p_s = tl.make_block_ptr(s + (bos * H + i_h) * S, (T, S), (H*S, 1), (i_t * BT, i_s * BS), (BT, BS), (1, 0))
-    p_o = tl.make_block_ptr(o + (bos * H + i_h) * S, (T, S), (H*S, 1), (i_t * BT, i_s * BS), (BT, BS), (1, 0))
-    # [BT, BS]
-    b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
-
-    # Apply dt_bias if exists
-    if HAS_BIAS:
-        p_b = tl.make_block_ptr(dt_bias + i_h * S, (S,), (1,), (i_s * BS,), (BS,), (0,))
-        b_bias = tl.load(p_b, boundary_check=(0,)).to(tl.float32)
-        b_s = b_s + b_bias[None, :]
-
-    b_A = tl.load(A_log + i_h).to(tl.float32)
-    if not USE_LOWER_BOUND:
-        # Apply gate: -exp(A_log) * softplus(g + bias)
-        b_gate = -exp(b_A) * softplus(b_s)
-    else:
-        b_gate = lower_bound * tl.sigmoid(exp(b_A) * b_s)
-
-    # Apply chunk local cumsum
-    if REVERSE:
-        b_o = tl.cumsum(b_gate, axis=0, reverse=True)
-    else:
-        b_o = tl.cumsum(b_gate, axis=0)
-
-    if HAS_SCALE:
-        b_o *= scale
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
-
-
-@input_guard
-def kda_gate_chunk_cumsum(
-    g: torch.Tensor,
-    A_log: torch.Tensor,
-    chunk_size: int,
-    scale: float = None,
-    dt_bias: torch.Tensor | None = None,
-    cu_seqlens: torch.Tensor | None = None,
-    output_dtype: torch.dtype | None = torch.float,
-    chunk_indices: torch.LongTensor | None = None,
-    lower_bound: float | None = None,
-    **kwargs,
-) -> torch.Tensor:
-    if cu_seqlens is not None:
-        assert g.shape[0] == 1, "Only batch size 1 is supported when cu_seqlens are provided"
-    assert len(g.shape) == 4
-    B, T, H, S = g.shape
-    BT = chunk_size
-    if chunk_indices is None and cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    assert chunk_size == 2**(chunk_size.bit_length()-1), "chunk_size must be a power of 2"
-
-    g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
-    def grid(meta): return (triton.cdiv(meta['S'], meta['BS']), NT, B * H)
-    kda_gate_chunk_cumsum_vector_kernel[grid](
-        s=g_org,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        o=g,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        lower_bound=lower_bound,
-        T=T,
-        H=H,
-        S=S,
-        BT=BT,
-        REVERSE=False,
-    )
-    return g
-
-# 1. 共享 helper：exp2、dtype / layout helper、shape validation
-
-
-# 2. 普通 Triton fallback
-    """
-    从 FLA main 的原始 chunk_gdn2 路径移植。
-    不包含 #990 的 fused TLE 优化，但语义必须完全一致。
-    """
-    ...
-
-
 
 #triton实现
-def chunk_gdn2_fwd_infer_triton(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    b: torch.Tensor,
-    w_gate: torch.Tensor,
-    scale: float,
-    initial_state: torch.Tensor | None,
-    output_final_state: bool,
-    cu_seqlens: torch.LongTensor | None = None,
-    cu_seqlens_cpu: torch.LongTensor | None = None,
-    chunk_indices: torch.LongTensor | None = None,
-    chunk_size: int = 64,
-    safe_gate: bool = False,
-    lower_bound: float | None = None,
-    use_gate_in_kernel: bool = False,
-    A_log: torch.Tensor | None = None,
-    dt_bias: torch.Tensor | None = None,
-    disable_recompute: bool = False,
-    return_intermediate_states: bool = False,
-    state_v_first: bool = False,
-    ):
-    """Top-level GDN-2 forward pipeline.
-
-    The pipeline is:
-        1. Compute the base-2 log-decay cumsum within each chunk
-            (``kda_gate_chunk_cumsum`` if ``use_gate_in_kernel`` else
-            ``chunk_local_cumsum``).
-        2. Build the intra-chunk score matrices (Aqk, Akk_inv) and the WY
-            auxiliaries (w_wy, u_wy, qg, kg) via ``chunk_gdn2_fwd_intra``.
-        3. Run the inter-chunk state recurrence (shared with KDA / GDN v1).
-        4. Compose the output via the GLA-style ``chunk_gla_fwd_o_gk``.
-
-    Returns ``(o, final_state, g_cumsum, Aqk, Akk, w_wy, u_wy, qg, kg, v_new,
-    h, initial_state)``.
-    """
-    if use_gate_in_kernel:
-        g = kda_gate_chunk_cumsum(
-            g=g,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            scale=RCP_LN2,
-            chunk_size=chunk_size,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            lower_bound=lower_bound,
-        )
-    else:
-        g_cumsum = chunk_local_cumsum(
-            g=g.float() * RCP_LN2,
-            chunk_size=chunk_size,
-            cu_seqlens=cu_seqlens,
-            head_first=False,
-            output_dtype=torch.float32,
-        )
-
-    w_wy, u_wy, qg, kg, Aqk, Akk = chunk_gdn2_fwd_intra(
-        q=q,
-        k=k,
-        v=v,
-        gk=g,
-        b=b,
-        w_gate=w_gate,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-        chunk_indices=chunk_indices,
-        safe_gate=safe_gate,
-        disable_recompute=disable_recompute,
-    )
-
-    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
-    k=kg,
-    w=w_wy,
-    u=u_wy,
-    gk=g_cumsum,
-    initial_state=initial_state,
-    output_final_state=output_final_state,
-    chunk_size=64,
-    cu_seqlens=cu_seqlens,
-)
-
-    o = chunk_gla_fwd_o_gk(
-        q=q,
-        v=v_new,
-        g=g,
-        A=Aqk,
-        h=h,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-        chunk_indices=chunk_indices,
-        state_v_first=state_v_first,
-    )
-
-    if disable_recompute is False:
-        # Free intermediates that the backward will recompute.
-        w_wy, u_wy, qg, kg, v_new = None, None, None, None, None
-        if not return_intermediate_states:
-            h = None
-        if use_gate_in_kernel:
-            g = None
-    return o, final_state, g, Aqk, Akk, w_wy, u_wy, qg, kg, v_new, h, initial_state
-
-
 
 # 3. TLE K1：从 #990 搬
 if HAS_TLE_GDN2:
@@ -1261,9 +1022,28 @@ def chunk_gdn2(
     chunk_indices=None,
 ):
     if not HAS_TLE_GDN2:
-        raise RuntimeError(
-            "chunk_gdn2 currently requires a Triton TLE environment; "
-            "the plain-Triton fallback has not been ported yet."
+        return chunk_gdn2_fwd(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            b=b,
+            w=w,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            state_v_first=state_v_first,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            safe_gate=safe_gate,
+            lower_bound=lower_bound,
+            chunk_size=chunk_size,
+            return_intermediate_states=return_intermediate_states,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            chunk_indices=chunk_indices,
         )
 
     return chunk_gdn2_fwd_infer(

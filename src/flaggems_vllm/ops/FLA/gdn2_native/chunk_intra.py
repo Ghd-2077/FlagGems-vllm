@@ -32,6 +32,22 @@ from flaggems_vllm.ops.FLA.triton_ops_helper import (
     autotune_cache_kwargs,
     exp2,
 )
+IS_TF32_SUPPORTED = (
+    torch.cuda.is_available()
+    and torch.cuda.get_device_capability()[0] >= 8
+)
+
+IS_GATHER_SUPPORTED = hasattr(tl, "gather")
+
+if IS_GATHER_SUPPORTED:
+    gather = tl.gather
+else:
+
+    @triton.jit
+    def gather(src, index, axis, _builder=None):
+        # 仅用于让 Triton 解析 inactive branch；
+        # 实际运行时 USE_GATHER=False，不会执行这里。
+        return None
 
 if IS_TF32_SUPPORTED:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr('tf32')

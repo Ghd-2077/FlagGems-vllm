@@ -11,9 +11,12 @@ import torch
 
 from flaggems_vllm.ops.FLA.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from flaggems_vllm.ops.FLA.cumsum import chunk_local_cumsum
-
+from flaggems_vllm.ops.FLA.chunk_gla import chunk_gla_fwd_o_gk 
+from .gate import kda_gate_chunk_cumsum
 from .chunk_intra import chunk_gdn2_fwd_intra
+import math
 
+LN2 = math.log(2.0)
 RCP_LN2 = 1.4426950216
 
 
@@ -72,6 +75,7 @@ def chunk_gdn2_fwd(
     cu_seqlens=cu_seqlens,
     output_dtype=torch.float32,
 )
+        g_K2=g * LN2
 
     w_wy, u_wy, qg, kg, Aqk, Akk = chunk_gdn2_fwd_intra(
         q=q,
@@ -92,7 +96,7 @@ def chunk_gdn2_fwd(
         k=kg,
         w=w_wy,
         u=u_wy,
-        gk=g,
+        gk=g_K2,
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
@@ -101,6 +105,10 @@ def chunk_gdn2_fwd(
         chunk_size=chunk_size,
         state_v_first=state_v_first,
     )
+    if state_v_first:
+        h = h.transpose(-1, -2).contiguous()
+        if final_state is not None:
+            final_state = final_state.transpose(-1, -2).contiguous()
 
     o = chunk_gla_fwd_o_gk(
         q=q,

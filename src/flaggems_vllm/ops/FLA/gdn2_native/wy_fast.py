@@ -27,9 +27,11 @@ import torch
 import triton
 import triton.language as tl
 
-from fla.ops.utils import prepare_chunk_indices
-from fla.ops.utils.op import exp2
-from fla.utils import autotune_cache_kwargs
+from flaggems_vllm.ops.FLA.index import prepare_chunk_indices
+from flaggems_vllm.ops.FLA.triton_ops_helper import (
+    autotune_cache_kwargs,
+    exp2,
+)
 
 
 @triton.heuristics({
