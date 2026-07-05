@@ -14,6 +14,7 @@ otherwise Triton.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -26,6 +27,8 @@ from flaggems_vllm.ops.FLA.triton_ops_helper import autotune_cache_kwargs
 
 from .gdn2_native.chunk_fwd import chunk_gdn2_fwd
 
+LN2 = 0.6931471805599453
+RCP_LN2 = 1.4426950408889634
 
 if has_triton_tle(3, 6, 0):
     try:
@@ -84,7 +87,7 @@ softplus=softplus_nv
 
 #triton实现
 
-# 3. TLE K1：从 #990 搬
+# 3. TLE kernels for GDN-2 prefill, BT=16, inference path.
 if HAS_TLE_GDN2:
     
     # =============================================================================
@@ -1022,20 +1025,37 @@ def chunk_gdn2(
     chunk_indices=None,
 ):
     if not HAS_TLE_GDN2:
-        return chunk_gdn2_fwd(
+        if scale is None:
+            scale = q.shape[-1] ** -0.5
+        if use_qk_l2norm_in_kernel:
+            q = F.normalize(q.float(), p=2, dim=-1, eps=1e-6).to(q.dtype)
+            k = F.normalize(k.float(), p=2, dim=-1, eps=1e-6).to(k.dtype)
+        (
+            o,
+            final_state,
+            _g,
+            _Aqk,
+            _Akk,
+            _w_wy,
+            _u_wy,
+            _qg,
+            _kg,
+            _v_new,
+            h,
+            _initial_state,
+        ) = chunk_gdn2_fwd(
             q=q,
             k=k,
             v=v,
             g=g,
             b=b,
-            w=w,
+            w_gate=w,
             A_log=A_log,
             dt_bias=dt_bias,
             scale=scale,
             initial_state=initial_state,
             output_final_state=output_final_state,
             state_v_first=state_v_first,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             use_gate_in_kernel=use_gate_in_kernel,
             safe_gate=safe_gate,
             lower_bound=lower_bound,
@@ -1045,6 +1065,9 @@ def chunk_gdn2(
             cu_seqlens_cpu=cu_seqlens_cpu,
             chunk_indices=chunk_indices,
         )
+        if return_intermediate_states:
+            return o, final_state, h
+        return o, final_state
 
     return chunk_gdn2_fwd_infer(
         q=q,

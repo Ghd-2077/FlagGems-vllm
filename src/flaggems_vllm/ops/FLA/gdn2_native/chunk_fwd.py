@@ -11,13 +11,12 @@ import torch
 
 from flaggems_vllm.ops.FLA.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from flaggems_vllm.ops.FLA.cumsum import chunk_local_cumsum
-from flaggems_vllm.ops.FLA.chunk_gla import chunk_gla_fwd_o_gk 
+from flaggems_vllm.ops.FLA.chunk_gla import chunk_gla_fwd_o_gk
 from .gate import kda_gate_chunk_cumsum
 from .chunk_intra import chunk_gdn2_fwd_intra
-import math
 
-LN2 = math.log(2.0)
-RCP_LN2 = 1.4426950216
+LN2 = 0.6931471805599453
+RCP_LN2 = 1.4426950408889634
 
 
 def chunk_gdn2_fwd(
@@ -70,12 +69,14 @@ def chunk_gdn2_fwd(
         )
     else:
         g = chunk_local_cumsum(
-    g=g.float() * RCP_LN2,
-    chunk_size=chunk_size,
-    cu_seqlens=cu_seqlens,
-    output_dtype=torch.float32,
-)
-        g_K2=g * LN2
+            g=g.float() * RCP_LN2,
+            chunk_size=chunk_size,
+            cu_seqlens=cu_seqlens,
+            output_dtype=torch.float32,
+        )
+    # The intra/output kernels use exp2, while this repository's state kernel
+    # uses natural exp for gk. Keep both bases explicit.
+    g_K2 = g * LN2
 
     w_wy, u_wy, qg, kg, Aqk, Akk = chunk_gdn2_fwd_intra(
         q=q,
@@ -100,10 +101,7 @@ def chunk_gdn2_fwd(
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
-        cu_seqlens_cpu=cu_seqlens_cpu,
-        chunk_indices=chunk_indices,
         chunk_size=chunk_size,
-        state_v_first=state_v_first,
     )
     if state_v_first:
         h = h.transpose(-1, -2).contiguous()

@@ -12,15 +12,33 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from fla.ops.utils.cache import fla_cache_autotune
-from fla.ops.utils.index import prepare_chunk_indices
-from fla.ops.utils.op import exp
-from fla.ops.utils.softplus import softplus
-from fla.utils import IS_AMD, autocast_custom_bwd, autocast_custom_fwd, autotune_cache_kwargs, check_shared_mem, input_guard
+from flaggems_vllm.ops.FLA.index import prepare_chunk_indices
+from flaggems_vllm.ops.FLA.triton_ops_helper import (
+    autotune_cache_kwargs,
+    exp,
+)
 
-BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
+
+def input_guard(fn):
+    return fn
+
+
+def autocast_custom_fwd(fn):
+    return fn
+
+
+def autocast_custom_bwd(fn):
+    return fn
+
+
+@triton.jit
+def softplus(x):
+    return tl.where(x > 20.0, x, tl.log(1.0 + exp(x)))
+
+
+BS_LIST = [32, 64]
 BT_LIST_AUTOTUNE = [32, 64, 128]
-NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if IS_AMD else [4, 8, 16, 32]
+NUM_WARPS_AUTOTUNE = [4, 8, 16, 32]
 
 
 def naive_kda_gate(
@@ -74,7 +92,7 @@ def naive_kda_lowerbound_gate(
     "HAS_BETA": lambda args: args["beta"] is not None,
     'USE_LOWER_BOUND': lambda args: args['lower_bound'] is not None,
 })
-@fla_cache_autotune(
+@triton.autotune(
     configs=[
         triton.Config({"BT": BT}, num_warps=num_warps, num_stages=num_stages)
         for BT in BT_LIST_AUTOTUNE
@@ -131,7 +149,7 @@ def kda_gate_fwd_kernel(
     "HAS_BETA": lambda args: args["beta"] is not None,
     'USE_LOWER_BOUND': lambda args: args['lower_bound'] is not None,
 })
-@fla_cache_autotune(
+@triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in NUM_WARPS_AUTOTUNE
@@ -350,7 +368,7 @@ def fused_kda_gate(
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
     'USE_LOWER_BOUND': lambda args: args['lower_bound'] is not None,
 })
-@fla_cache_autotune(
+@triton.autotune(
     configs=[
         triton.Config({'BS': BS}, num_warps=num_warps)
         for BS in BS_LIST
