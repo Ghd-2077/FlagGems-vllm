@@ -19,10 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm.ops.FLA.triton_ops_helper import (
-    autotune_cache_kwargs,
-    exp2,
-)
+from flaggems_vllm.ops.FLA.triton_ops_helper import autotune_cache_kwargs, exp2
 
 __all__ = [
     "chunk_gdn2_fwd_kernel_intra_token_parallel",
@@ -196,10 +193,7 @@ def chunk_gdn2_fwd_kernel_intra_token_parallel(
         akk *= tl.where(j < local_t, 1.0, 0.0)
 
         tl.store(
-            Aqk
-            + local_t * H * BT
-            + (i_h_group * BH + offsets_h) * BT
-            + j % BT,
+            Aqk + local_t * H * BT + (i_h_group * BH + offsets_h) * BT + j % BT,
             aqk.to(Aqk.dtype.element_ty),
             mask=mask_h,
         )

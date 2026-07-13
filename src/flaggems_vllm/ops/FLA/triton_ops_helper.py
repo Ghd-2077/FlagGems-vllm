@@ -26,6 +26,8 @@ exp = get_exp()
 def log(x):
     """Wrapper around tl.log that casts to fp32 first (matching the original FLA op.py)."""
     return tl.log(x.to(tl.float32))
+
+
 @triton.jit
 def exp2(x):
     """Base-2 exponential with fp32 computation."""

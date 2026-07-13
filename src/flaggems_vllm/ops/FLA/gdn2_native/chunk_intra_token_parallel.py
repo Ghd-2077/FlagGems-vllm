@@ -21,25 +21,24 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm.ops.FLA.triton_ops_helper import (
-    autotune_cache_kwargs,
-    exp2,
+from flaggems_vllm.ops.FLA.triton_ops_helper import autotune_cache_kwargs, exp2
+
+
+@triton.heuristics(
+    {
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
 )
-
-
-@triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-})
 @triton.autotune(
     configs=[
-        triton.Config({'BH': BH}, num_warps=num_warps)
+        triton.Config({"BH": BH}, num_warps=num_warps)
         for BH in [1, 2, 4, 8]
         for num_warps in [1, 2, 4, 8]
     ],
     key=["K", "H"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T', 'N'])
+@triton.jit(do_not_specialize=["T", "N"])
 def chunk_gdn2_fwd_kernel_intra_token_parallel(
     q,
     k,
@@ -71,7 +70,9 @@ def chunk_gdn2_fwd_kernel_intra_token_parallel(
                 else:
                     left = mid + 1
         i_n = left
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
+            cu_seqlens + i_n + 1
+        ).to(tl.int32)
         T = eos - bos
         i_t = i_tg - bos
     else:
@@ -99,10 +100,18 @@ def chunk_gdn2_fwd_kernel_intra_token_parallel(
     m_h = (i_hg * BH + o_h) < H
     m_k = o_k < K
 
-    p_q = tl.make_block_ptr(q + i_t * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0))
-    p_k = tl.make_block_ptr(k + i_t * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0))
-    p_g = tl.make_block_ptr(g + i_t * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0))
-    p_b = tl.make_block_ptr(b + i_t * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0))
+    p_q = tl.make_block_ptr(
+        q + i_t * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0)
+    )
+    p_k = tl.make_block_ptr(
+        k + i_t * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0)
+    )
+    p_g = tl.make_block_ptr(
+        g + i_t * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0)
+    )
+    p_b = tl.make_block_ptr(
+        b + i_t * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0)
+    )
 
     b_q = tl.load(p_q, boundary_check=(0, 1)).to(tl.float32)
     b_k = tl.load(p_k, boundary_check=(0, 1)).to(tl.float32)
@@ -113,8 +122,12 @@ def chunk_gdn2_fwd_kernel_intra_token_parallel(
     b_k = b_k * b_b
 
     for j in range(i_ts, min(i_t + 1, min(T, i_ts + BC))):
-        p_kj = tl.make_block_ptr(k + j * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0))
-        p_gj = tl.make_block_ptr(g + j * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0))
+        p_kj = tl.make_block_ptr(
+            k + j * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0)
+        )
+        p_gj = tl.make_block_ptr(
+            g + j * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0)
+        )
         b_kj = tl.load(p_kj, boundary_check=(0, 1)).to(tl.float32)
         b_gj = tl.load(p_gj, boundary_check=(0, 1)).to(tl.float32)
 
@@ -125,11 +138,13 @@ def chunk_gdn2_fwd_kernel_intra_token_parallel(
 
         tl.store(
             Aqk + i_t * H * BT + (i_hg * BH + o_h) * BT + j % BT,
-            b_Aqk.to(Aqk.dtype.element_ty), mask=m_h,
+            b_Aqk.to(Aqk.dtype.element_ty),
+            mask=m_h,
         )
         tl.store(
             Akk + i_t * H * BC + (i_hg * BH + o_h) * BC + j - i_ts,
-            b_Akk.to(Akk.dtype.element_ty), mask=m_h,
+            b_Akk.to(Akk.dtype.element_ty),
+            mask=m_h,
         )
 
 
@@ -152,7 +167,7 @@ def chunk_gdn2_fwd_intra_token_parallel(
     BC = sub_chunk_size
 
     def grid(meta):
-        return (B * T, triton.cdiv(H, meta['BH']))
+        return (B * T, triton.cdiv(H, meta["BH"]))
 
     chunk_gdn2_fwd_kernel_intra_token_parallel[grid](
         q=q,

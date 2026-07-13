@@ -28,37 +28,36 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.ops.FLA.index import prepare_chunk_indices
-from flaggems_vllm.ops.FLA.triton_ops_helper import (
-    autotune_cache_kwargs,
-    exp2,
+from flaggems_vllm.ops.FLA.triton_ops_helper import autotune_cache_kwargs, exp2
+
+
+@triton.heuristics(
+    {
+        "STORE_QG": lambda args: args["qg"] is not None,
+        "STORE_KG": lambda args: args["kg"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
 )
-
-
-@triton.heuristics({
-    'STORE_QG': lambda args: args['qg'] is not None,
-    'STORE_KG': lambda args: args['kg'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-})
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
+    key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=["T"])
 def recompute_w_u_fwd_gdn2_kernel(
     q,
     k,
     qg,
     kg,
     v,
-    b,           # channel-wise erase gate, [B, T, H, K]
-    w_gate,      # channel-wise write gate, [B, T, H, V]
-    w,           # output: A @ (b * exp(gk) * k), [B, T, H, K]
-    u,           # output: A @ (w_gate * v), [B, T, H, V]
+    b,  # channel-wise erase gate, [B, T, H, K]
+    w_gate,  # channel-wise write gate, [B, T, H, V]
+    w,  # output: A @ (b * exp(gk) * k), [B, T, H, K]
+    u,  # output: A @ (w_gate * v), [B, T, H, V]
     A,
     gk,
     cu_seqlens,
@@ -77,30 +76,50 @@ def recompute_w_u_fwd_gdn2_kernel(
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
+            chunk_indices + i_t * 2 + 1
+        ).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
+            cu_seqlens + i_n + 1
+        ).to(tl.int32)
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
 
     p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1),
-        (i_t * BT, 0), (BT, BT), (1, 0),
+        A + (bos * H + i_h) * BT,
+        (T, BT),
+        (H * BT, 1),
+        (i_t * BT, 0),
+        (BT, BT),
+        (1, 0),
     )
     b_A = tl.load(p_A, boundary_check=(0, 1))
 
     for i_v in range(tl.cdiv(V, BV)):
         p_v = tl.make_block_ptr(
-            v + (bos * H + i_h) * V, (T, V), (H * V, 1),
-            (i_t * BT, i_v * BV), (BT, BV), (1, 0),
+            v + (bos * H + i_h) * V,
+            (T, V),
+            (H * V, 1),
+            (i_t * BT, i_v * BV),
+            (BT, BV),
+            (1, 0),
         )
         p_u = tl.make_block_ptr(
-            u + (bos * H + i_h) * V, (T, V), (H * V, 1),
-            (i_t * BT, i_v * BV), (BT, BV), (1, 0),
+            u + (bos * H + i_h) * V,
+            (T, V),
+            (H * V, 1),
+            (i_t * BT, i_v * BV),
+            (BT, BV),
+            (1, 0),
         )
         p_wg = tl.make_block_ptr(
-            w_gate + (bos * H + i_h) * V, (T, V), (H * V, 1),
-            (i_t * BT, i_v * BV), (BT, BV), (1, 0),
+            w_gate + (bos * H + i_h) * V,
+            (T, V),
+            (H * V, 1),
+            (i_t * BT, i_v * BV),
+            (BT, BV),
+            (1, 0),
         )
         b_v = tl.load(p_v, boundary_check=(0, 1))
         b_wg = tl.load(p_wg, boundary_check=(0, 1))
@@ -110,36 +129,60 @@ def recompute_w_u_fwd_gdn2_kernel(
 
     for i_k in range(tl.cdiv(K, BK)):
         p_w = tl.make_block_ptr(
-            w + (bos * H + i_h) * K, (T, K), (H * K, 1),
-            (i_t * BT, i_k * BK), (BT, BK), (1, 0),
+            w + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT, i_k * BK),
+            (BT, BK),
+            (1, 0),
         )
         p_k = tl.make_block_ptr(
-            k + (bos * H + i_h) * K, (T, K), (H * K, 1),
-            (i_t * BT, i_k * BK), (BT, BK), (1, 0),
+            k + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT, i_k * BK),
+            (BT, BK),
+            (1, 0),
         )
         p_b = tl.make_block_ptr(
-            b + (bos * H + i_h) * K, (T, K), (H * K, 1),
-            (i_t * BT, i_k * BK), (BT, BK), (1, 0),
+            b + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT, i_k * BK),
+            (BT, BK),
+            (1, 0),
         )
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_b = tl.load(p_b, boundary_check=(0, 1))
         b_kb = b_k * b_b
 
         p_gk = tl.make_block_ptr(
-            gk + (bos * H + i_h) * K, (T, K), (H * K, 1),
-            (i_t * BT, i_k * BK), (BT, BK), (1, 0),
+            gk + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT, i_k * BK),
+            (BT, BK),
+            (1, 0),
         )
         b_gk = tl.load(p_gk, boundary_check=(0, 1)).to(tl.float32)
         b_kb *= exp2(b_gk)
 
         if STORE_QG:
             p_q = tl.make_block_ptr(
-                q + (bos * H + i_h) * K, (T, K), (H * K, 1),
-                (i_t * BT, i_k * BK), (BT, BK), (1, 0),
+                q + (bos * H + i_h) * K,
+                (T, K),
+                (H * K, 1),
+                (i_t * BT, i_k * BK),
+                (BT, BK),
+                (1, 0),
             )
             p_qg = tl.make_block_ptr(
-                qg + (bos * H + i_h) * K, (T, K), (H * K, 1),
-                (i_t * BT, i_k * BK), (BT, BK), (1, 0),
+                qg + (bos * H + i_h) * K,
+                (T, K),
+                (H * K, 1),
+                (i_t * BT, i_k * BK),
+                (BT, BK),
+                (1, 0),
             )
             b_q = tl.load(p_q, boundary_check=(0, 1))
             b_qg = b_q * exp2(b_gk)
@@ -151,7 +194,8 @@ def recompute_w_u_fwd_gdn2_kernel(
             m_k = o_k < K
             b_gn = tl.load(
                 gk + ((bos + last_idx) * H + i_h) * K + o_k,
-                mask=m_k, other=0.,
+                mask=m_k,
+                other=0.0,
             ).to(tl.float32)
             b_kg = b_k * tl.where(
                 (i_t * BT + tl.arange(0, BT) < T)[:, None],
@@ -159,8 +203,12 @@ def recompute_w_u_fwd_gdn2_kernel(
                 0,
             )
             p_kg = tl.make_block_ptr(
-                kg + (bos * H + i_h) * K, (T, K), (H * K, 1),
-                (i_t * BT, i_k * BK), (BT, BK), (1, 0),
+                kg + (bos * H + i_h) * K,
+                (T, K),
+                (H * K, 1),
+                (i_t * BT, i_k * BK),
+                (BT, BK),
+                (1, 0),
             )
             tl.store(p_kg, b_kg.to(p_kg.dtype.element_ty), boundary_check=(0, 1))
 

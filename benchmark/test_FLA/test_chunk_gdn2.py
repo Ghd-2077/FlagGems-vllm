@@ -10,7 +10,6 @@ from benchmark.base import Benchmark
 from flaggems_vllm.ops.FLA import chunk_gdn2
 from flaggems_vllm.ops.FLA.gdn2_native.chunk_fwd import chunk_gdn2_fwd
 
-
 FORCE_NATIVE_ENV = "FLAGGEMS_VLLM_GDN2_FORCE_NATIVE"
 
 
@@ -133,7 +132,7 @@ class ChunkGDN2Benchmark(Benchmark):
 
     def _build_inputs(self, B, T, H, K, V, dtype):
         device = flaggems_vllm.device
-        scale = K ** -0.5
+        scale = K**-0.5
 
         q = torch.randn(B, T, H, K, device=device, dtype=dtype) / math.sqrt(K)
         k = torch.randn(B, T, H, K, device=device, dtype=dtype) / math.sqrt(K)
@@ -143,9 +142,9 @@ class ChunkGDN2Benchmark(Benchmark):
         )
         b = torch.rand(B, T, H, K, device=device, dtype=dtype)
         w = torch.rand(B, T, H, V, device=device, dtype=dtype)
-        initial_state = torch.randn(
-            B, H, K, V, device=device, dtype=torch.float32
-        ) * 0.01
+        initial_state = (
+            torch.randn(B, H, K, V, device=device, dtype=torch.float32) * 0.01
+        )
 
         return (
             q,

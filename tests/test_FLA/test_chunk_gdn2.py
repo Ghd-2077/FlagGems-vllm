@@ -8,7 +8,6 @@ import flaggems_vllm
 from flaggems_vllm.ops.FLA import chunk_gdn2
 from flaggems_vllm.ops.FLA.gdn2_native.chunk_fwd import chunk_gdn2_fwd
 
-
 ASSERT_RATIO = 0.01
 
 GDN2_TEST_SHAPES = [
@@ -106,7 +105,7 @@ def _native_gdn2_reference(
 
 def _make_inputs(*, B, T, H, K, V, dtype, state_v_first):
     device = flaggems_vllm.device
-    scale = K ** -0.5
+    scale = K**-0.5
 
     q = torch.randn(B, T, H, K, device=device, dtype=dtype) / math.sqrt(K)
     k = torch.randn(B, T, H, K, device=device, dtype=dtype) / math.sqrt(K)
@@ -114,9 +113,7 @@ def _make_inputs(*, B, T, H, K, V, dtype, state_v_first):
     b = torch.rand(B, T, H, K, device=device, dtype=dtype)
     w = torch.rand(B, T, H, V, device=device, dtype=dtype)
     initial_state = None
-    g = (-torch.rand(B, T, H, K, device=device, dtype=torch.float32) * 0.1).to(
-        dtype
-    )
+    g = (-torch.rand(B, T, H, K, device=device, dtype=torch.float32) * 0.1).to(dtype)
 
     A_log = None
     dt_bias = None
@@ -155,8 +152,7 @@ def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> No
     assert not torch.isnan(actual).any(), f"{name}: NaN detected in actual"
     assert not torch.isnan(expected).any(), f"{name}: NaN detected in baseline"
     assert ratio < ASSERT_RATIO, (
-        f"{name} diff: abs={abs_err:.6f} ratio={ratio:.6f} "
-        f"limit={ASSERT_RATIO}"
+        f"{name} diff: abs={abs_err:.6f} ratio={ratio:.6f} " f"limit={ASSERT_RATIO}"
     )
 
 

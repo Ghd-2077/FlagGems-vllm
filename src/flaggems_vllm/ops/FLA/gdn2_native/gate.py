@@ -13,10 +13,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.ops.FLA.index import prepare_chunk_indices
-from flaggems_vllm.ops.FLA.triton_ops_helper import (
-    autotune_cache_kwargs,
-    exp,
-)
+from flaggems_vllm.ops.FLA.triton_ops_helper import autotune_cache_kwargs, exp
 
 
 def input_guard(fn):
@@ -87,11 +84,13 @@ def naive_kda_lowerbound_gate(
     return g.to(output_dtype)
 
 
-@triton.heuristics({
-    "HAS_BIAS": lambda args: args["dt_bias"] is not None,
-    "HAS_BETA": lambda args: args["beta"] is not None,
-    'USE_LOWER_BOUND': lambda args: args['lower_bound'] is not None,
-})
+@triton.heuristics(
+    {
+        "HAS_BIAS": lambda args: args["dt_bias"] is not None,
+        "HAS_BETA": lambda args: args["beta"] is not None,
+        "USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None,
+    }
+)
 @triton.autotune(
     configs=[
         triton.Config({"BT": BT}, num_warps=num_warps, num_stages=num_stages)
@@ -102,7 +101,7 @@ def naive_kda_lowerbound_gate(
     key=["H", "D"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=["T"])
 def kda_gate_fwd_kernel(
     g,
     A_log,
@@ -124,8 +123,12 @@ def kda_gate_fwd_kernel(
 
     b_A = tl.load(A_log + i_h).to(tl.float32)
 
-    p_g = tl.make_block_ptr(g + i_h * D, (T, D), (H * D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    p_yg = tl.make_block_ptr(yg + i_h * D, (T, D), (H * D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
+    p_g = tl.make_block_ptr(
+        g + i_h * D, (T, D), (H * D, 1), (i_t * BT, 0), (BT, BD), (1, 0)
+    )
+    p_yg = tl.make_block_ptr(
+        yg + i_h * D, (T, D), (H * D, 1), (i_t * BT, 0), (BT, BD), (1, 0)
+    )
     # [BT, BD]
     b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
     if HAS_BIAS:
@@ -144,11 +147,13 @@ def kda_gate_fwd_kernel(
         tl.store(p_yb, b_yb.to(p_yb.dtype.element_ty), boundary_check=(0,))
 
 
-@triton.heuristics({
-    "HAS_BIAS": lambda args: args["dt_bias"] is not None,
-    "HAS_BETA": lambda args: args["beta"] is not None,
-    'USE_LOWER_BOUND': lambda args: args['lower_bound'] is not None,
-})
+@triton.heuristics(
+    {
+        "HAS_BIAS": lambda args: args["dt_bias"] is not None,
+        "HAS_BETA": lambda args: args["beta"] is not None,
+        "USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None,
+    }
+)
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
@@ -158,7 +163,7 @@ def kda_gate_fwd_kernel(
     key=["H", "D"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=["T"])
 def kda_gate_bwd_kernel(
     g,
     A_log,
@@ -183,9 +188,15 @@ def kda_gate_bwd_kernel(
 
     b_A = tl.load(A_log + i_h).to(tl.float32)
 
-    p_g = tl.make_block_ptr(g + i_h * D, (T, D), (H * D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    p_dg = tl.make_block_ptr(dg + i_h * D, (T, D), (H * D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    p_dyg = tl.make_block_ptr(dyg + i_h * D, (T, D), (H * D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
+    p_g = tl.make_block_ptr(
+        g + i_h * D, (T, D), (H * D, 1), (i_t * BT, 0), (BT, BD), (1, 0)
+    )
+    p_dg = tl.make_block_ptr(
+        dg + i_h * D, (T, D), (H * D, 1), (i_t * BT, 0), (BT, BD), (1, 0)
+    )
+    p_dyg = tl.make_block_ptr(
+        dyg + i_h * D, (T, D), (H * D, 1), (i_t * BT, 0), (BT, BD), (1, 0)
+    )
 
     # [BT, BD]
     b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
@@ -314,7 +325,7 @@ class KDAGateFunction(torch.autograd.Function):
             A_log=A_log,
             dt_bias=dt_bias,
             lower_bound=lower_bound,
-            output_dtype=output_dtype
+            output_dtype=output_dtype,
         )
         ctx.save_for_backward(g, A_log, dt_bias)
         ctx.lower_bound = lower_bound
@@ -326,11 +337,7 @@ class KDAGateFunction(torch.autograd.Function):
     def backward(ctx, dyg: torch.Tensor):
         g, A_log, dt_bias = ctx.saved_tensors
         dg, dA, dbias = kda_gate_bwd(
-            g=g,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            dyg=dyg,
-            lower_bound=ctx.lower_bound
+            g=g, A_log=A_log, dt_bias=dt_bias, dyg=dyg, lower_bound=ctx.lower_bound
         )
         return dg, dA, dbias, None, None
 
@@ -362,22 +369,24 @@ def fused_kda_gate(
     return KDAGateFunction.apply(g, A_log, dt_bias, lower_bound, output_dtype)
 
 
-@triton.heuristics({
-    "HAS_BIAS": lambda args: args["dt_bias"] is not None,
-    'HAS_SCALE': lambda args: args['scale'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-    'USE_LOWER_BOUND': lambda args: args['lower_bound'] is not None,
-})
+@triton.heuristics(
+    {
+        "HAS_BIAS": lambda args: args["dt_bias"] is not None,
+        "HAS_SCALE": lambda args: args["scale"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None,
+    }
+)
 @triton.autotune(
     configs=[
-        triton.Config({'BS': BS}, num_warps=num_warps)
+        triton.Config({"BS": BS}, num_warps=num_warps)
         for BS in BS_LIST
         for num_warps in [2, 4, 8]
     ],
-    key=['H', 'S', 'BT', 'IS_VARLEN', 'REVERSE'],
+    key=["H", "S", "BT", "IS_VARLEN", "REVERSE"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=["T"])
 def kda_gate_chunk_cumsum_vector_kernel(
     s,
     A_log,
@@ -401,14 +410,32 @@ def kda_gate_chunk_cumsum_vector_kernel(
     i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
+            chunk_indices + i_t * 2 + 1
+        ).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
+            cu_seqlens + i_n + 1
+        ).to(tl.int32)
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
 
-    p_s = tl.make_block_ptr(s + (bos * H + i_h) * S, (T, S), (H*S, 1), (i_t * BT, i_s * BS), (BT, BS), (1, 0))
-    p_o = tl.make_block_ptr(o + (bos * H + i_h) * S, (T, S), (H*S, 1), (i_t * BT, i_s * BS), (BT, BS), (1, 0))
+    p_s = tl.make_block_ptr(
+        s + (bos * H + i_h) * S,
+        (T, S),
+        (H * S, 1),
+        (i_t * BT, i_s * BS),
+        (BT, BS),
+        (1, 0),
+    )
+    p_o = tl.make_block_ptr(
+        o + (bos * H + i_h) * S,
+        (T, S),
+        (H * S, 1),
+        (i_t * BT, i_s * BS),
+        (BT, BS),
+        (1, 0),
+    )
     # [BT, BS]
     b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
 
@@ -450,17 +477,24 @@ def kda_gate_chunk_cumsum(
     **kwargs,
 ) -> torch.Tensor:
     if cu_seqlens is not None:
-        assert g.shape[0] == 1, "Only batch size 1 is supported when cu_seqlens are provided"
+        assert (
+            g.shape[0] == 1
+        ), "Only batch size 1 is supported when cu_seqlens are provided"
     assert len(g.shape) == 4
     B, T, H, S = g.shape
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    assert chunk_size == 2**(chunk_size.bit_length()-1), "chunk_size must be a power of 2"
+    assert chunk_size == 2 ** (
+        chunk_size.bit_length() - 1
+    ), "chunk_size must be a power of 2"
 
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
-    def grid(meta): return (triton.cdiv(meta['S'], meta['BS']), NT, B * H)
+
+    def grid(meta):
+        return (triton.cdiv(meta["S"], meta["BS"]), NT, B * H)
+
     kda_gate_chunk_cumsum_vector_kernel[grid](
         s=g_org,
         A_log=A_log,

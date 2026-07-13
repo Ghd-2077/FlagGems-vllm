@@ -18,12 +18,10 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+# 此仓库的pre index的入口参数没有BT，不支持varlen
+from flaggems_vllm.ops.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
+from flaggems_vllm.ops.FLA.triton_ops_helper import autotune_cache_kwargs, exp2
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
-from flaggems_vllm.ops.FLA.triton_ops_helper import exp2
-#此仓库的pre index的入口参数没有BT，不支持varlen
-from flaggems_vllm.ops.FLA.index import prepare_chunk_indices,prepare_chunk_offsets
-
-from flaggems_vllm.ops.FLA.triton_ops_helper import autotune_cache_kwargs
 
 from .gdn2_native.chunk_fwd import chunk_gdn2_fwd
 
@@ -33,6 +31,7 @@ RCP_LN2 = 1.4426950408889634
 if has_triton_tle(3, 6, 0):
     try:
         import triton.experimental.tle.language as tle
+
         HAS_TLE_GDN2 = True
     except ImportError:
         tle = None
@@ -42,10 +41,17 @@ else:
     HAS_TLE_GDN2 = False
 
 
-
 __all__ = ["chunk_gdn2"]
+
+
 def _generate_constraints(num_pack):
-    return ",".join("=r" for i in range(num_pack)) + "," + ",".join("r" for i in range(num_pack))
+    return (
+        ",".join("=r" for i in range(num_pack))
+        + ","
+        + ",".join("r" for i in range(num_pack))
+    )
+
+
 def _generate_softplus(num_pack):
     template = """
         .reg .pred p;
@@ -65,10 +71,14 @@ def _generate_softplus(num_pack):
     # flatten out because torch.compile doesn't like newlines
     out_str = " ".join(out_str.split("\n"))
     return out_str
+
+
 _NUM_REG = 1
 s_softplus: tl.constexpr = tl.constexpr(_generate_softplus(_NUM_REG))
 s_constraints: tl.constexpr = tl.constexpr(_generate_constraints(_NUM_REG))
 NUM_REG: tl.constexpr = tl.constexpr(_NUM_REG)
+
+
 @triton.jit
 def softplus_nv(x):
     # equivalent to:
@@ -83,30 +93,35 @@ def softplus_nv(x):
         dtype=tl.float32,
         is_pure=True,
     )
-softplus=softplus_nv
 
-#triton实现
+
+softplus = softplus_nv
+
+# triton实现
 
 # 3. TLE kernels for GDN-2 prefill, BT=16, inference path.
 if HAS_TLE_GDN2:
-    
+
     # =============================================================================
     # K1: fused intra-chunk kernel, parallel over (chunk, batch*head)
     # =============================================================================
 
-
-    @triton.heuristics({
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        "STORE_QG": lambda args: args["qg"] is not None,
-        "STORE_KG": lambda args: args["kg"] is not None,
-        "USE_GATE_IN_KERNEL": lambda args: args["A_log"] is not None,
-        "USE_QK_L2NORM": lambda args: args["use_qk_l2norm"],
-        "USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None,
-        "HAS_DT_BIAS": lambda args: args["dt_bias"] is not None,
-    })
+    @triton.heuristics(
+        {
+            "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+            "STORE_QG": lambda args: args["qg"] is not None,
+            "STORE_KG": lambda args: args["kg"] is not None,
+            "USE_GATE_IN_KERNEL": lambda args: args["A_log"] is not None,
+            "USE_QK_L2NORM": lambda args: args["use_qk_l2norm"],
+            "USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None,
+            "HAS_DT_BIAS": lambda args: args["dt_bias"] is not None,
+        }
+    )
     @triton.autotune(
         configs=[
-            triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
+            triton.Config(
+                {"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages
+            )
             for BK in [16, 32, 64]
             for BV in [16, 32, 64]
             for num_warps in [1, 2, 4]
@@ -117,22 +132,22 @@ if HAS_TLE_GDN2:
     )
     @triton.jit(do_not_specialize=["T"])
     def _chunk_gdn2_fwd_intra_infer_kernel(
-        q,              # [B, T, H, K]
-        k,              # [B, T, H, K]
-        v,              # [B, T, H, V]
-        g,              # [B, T, H, K], raw gate if USE_GATE_IN_KERNEL else log-decay
-        b,              # [B, T, H, K], GDN-2 erase gate on K axis
-        write_w_gate,   # [B, T, H, V], GDN-2 write gate on V axis
-        w_wy,           # [B, T, H, K], WY erase auxiliary
-        u_wy,           # [B, T, H, V], WY write/value auxiliary
-        qg,             # [B, T, H, K]
-        kg,             # [B, T, H, K]
-        Aqk,            # [B, T, H, BT]
-        Akk,            # [B, T, H, BT]
-        g_out,          # [B, T, H, K], base-2 local cumsum(g)
-        A_log,          # [H], optional if gate-in-kernel
-        dt_bias,        # [H*K], optional if gate-in-kernel
-        lower_bound,    # optional safe lower bound in log space, e.g. -5.0
+        q,  # [B, T, H, K]
+        k,  # [B, T, H, K]
+        v,  # [B, T, H, V]
+        g,  # [B, T, H, K], raw gate if USE_GATE_IN_KERNEL else log-decay
+        b,  # [B, T, H, K], GDN-2 erase gate on K axis
+        write_w_gate,  # [B, T, H, V], GDN-2 write gate on V axis
+        w_wy,  # [B, T, H, K], WY erase auxiliary
+        u_wy,  # [B, T, H, V], WY write/value auxiliary
+        qg,  # [B, T, H, K]
+        kg,  # [B, T, H, K]
+        Aqk,  # [B, T, H, BT]
+        Akk,  # [B, T, H, BT]
+        g_out,  # [B, T, H, K], base-2 local cumsum(g)
+        A_log,  # [H], optional if gate-in-kernel
+        dt_bias,  # [H*K], optional if gate-in-kernel
+        lower_bound,  # optional safe lower bound in log space, e.g. -5.0
         scale: float,
         g_scale: float,
         l2norm_eps: float,
@@ -236,8 +251,12 @@ if HAS_TLE_GDN2:
                 b, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
             )
 
-            b_q_blk = tl.load(p_q, boundary_check=(0, 1)).to(tl.float32) * b_q_rstd[:, None]
-            b_k_blk = tl.load(p_k, boundary_check=(0, 1)).to(tl.float32) * b_k_rstd[:, None]
+            b_q_blk = (
+                tl.load(p_q, boundary_check=(0, 1)).to(tl.float32) * b_q_rstd[:, None]
+            )
+            b_k_blk = (
+                tl.load(p_k, boundary_check=(0, 1)).to(tl.float32) * b_k_rstd[:, None]
+            )
             b_g_blk = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
             b_erase_blk = tl.load(p_b, boundary_check=(0, 1)).to(tl.float32)
 
@@ -326,7 +345,9 @@ if HAS_TLE_GDN2:
                 g_out, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
             )
 
-            b_k_blk = tl.load(p_k, boundary_check=(0, 1)).to(tl.float32) * b_k_rstd[:, None]
+            b_k_blk = (
+                tl.load(p_k, boundary_check=(0, 1)).to(tl.float32) * b_k_rstd[:, None]
+            )
             b_erase_blk = tl.load(p_b, boundary_check=(0, 1)).to(tl.float32)
             b_gk_blk = tl.load(p_gk, boundary_check=(0, 1)).to(tl.float32)
             b_k_erase = b_k_blk * b_erase_blk * exp2(b_gk_blk)
@@ -338,7 +359,10 @@ if HAS_TLE_GDN2:
                 p_qg = tl.make_block_ptr(
                     qg, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
                 )
-                b_q_blk = tl.load(p_q, boundary_check=(0, 1)).to(tl.float32) * b_q_rstd[:, None]
+                b_q_blk = (
+                    tl.load(p_q, boundary_check=(0, 1)).to(tl.float32)
+                    * b_q_rstd[:, None]
+                )
                 b_qg_val = b_q_blk * exp2(b_gk_blk)
                 tl.store(p_qg, b_qg_val.to(qg.dtype.element_ty), boundary_check=(0, 1))
 
@@ -346,8 +370,12 @@ if HAS_TLE_GDN2:
                 o_k = i_k * BK + tl.arange(0, BK)
                 m_k = o_k < K
                 last_idx = tl.minimum(i_t * BT + BT, T) - 1
-                b_gn = tl.load(g_out + last_idx * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
-                b_kg_val = b_k_blk * tl.where(m_c[:, None], exp2(b_gn[None, :] - b_gk_blk), 0.0)
+                b_gn = tl.load(g_out + last_idx * H * K + o_k, mask=m_k, other=0.0).to(
+                    tl.float32
+                )
+                b_kg_val = b_k_blk * tl.where(
+                    m_c[:, None], exp2(b_gn[None, :] - b_gk_blk), 0.0
+                )
                 p_kg = tl.make_block_ptr(
                     kg, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
                 )
@@ -358,7 +386,6 @@ if HAS_TLE_GDN2:
             )
             b_w_blk = tl.dot(b_Ai.to(b_k_erase.dtype), b_k_erase)
             tl.store(p_w, b_w_blk.to(w_wy.dtype.element_ty), boundary_check=(0, 1))
-
 
     def chunk_gdn2_fwd_intra_infer(
         q: torch.Tensor,
@@ -376,7 +403,15 @@ if HAS_TLE_GDN2:
         A_log: torch.Tensor | None = None,
         dt_bias: torch.Tensor | None = None,
         use_qk_l2norm: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """Fused intra-chunk GDN-2 inference preprocessing for BT=16.
 
         Returns: (w_wy, u_wy, qg, kg, Aqk, Akk_inv, g_cumsum_base2)
@@ -386,7 +421,9 @@ if HAS_TLE_GDN2:
         BT = chunk_size
 
         if BT != 16:
-            raise ValueError(f"Flash-style GDN-2 fused inference requires chunk_size=16, got {BT}.")
+            raise ValueError(
+                f"Flash-style GDN-2 fused inference requires chunk_size=16, got {BT}."
+            )
 
         if chunk_indices is None and cu_seqlens is not None:
             chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
@@ -433,18 +470,18 @@ if HAS_TLE_GDN2:
         )
         return w_wy, u_wy, qg, kg, Aqk, Akk, g_out
 
-
     # =============================================================================
     # K2: fused state propagation + output, sequential over chunks per (batch, head, V-tile)
     # =============================================================================
 
-
-    @triton.heuristics({
-        "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
-        "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
-        "STORE_H": lambda args: args["h"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-    })
+    @triton.heuristics(
+        {
+            "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
+            "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
+            "STORE_H": lambda args: args["h"] is not None,
+            "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        }
+    )
     @triton.autotune(
         configs=[
             triton.Config({"BV": BV}, num_warps=num_warps)
@@ -455,16 +492,16 @@ if HAS_TLE_GDN2:
     )
     @triton.jit(do_not_specialize=["T"])
     def _chunk_gdn2_fwd_h_o_infer_kernel(
-        kg,          # [B, T, H, K]
-        w_wy,        # [B, T, H, K]
-        u_wy,        # [B, T, H, V]
-        gk,          # [B, T, H, K] base-2 local cumsum
-        qg,          # [B, T, H, K]
-        Aqk,         # [B, T, H, BT]
-        o,           # [B, T, H, V]
-        h,           # optional [N, NT, H, K, V] or [N, NT, H, V, K]
-        h0,          # optional initial state
-        ht,          # optional final state
+        kg,  # [B, T, H, K]
+        w_wy,  # [B, T, H, K]
+        u_wy,  # [B, T, H, V]
+        gk,  # [B, T, H, K] base-2 local cumsum
+        qg,  # [B, T, H, K]
+        Aqk,  # [B, T, H, BT]
+        o,  # [B, T, H, V]
+        h,  # optional [N, NT, H, K, V] or [N, NT, H, V, K]
+        h0,  # optional initial state
+        ht,  # optional final state
         cu_seqlens,
         chunk_offsets,
         scale: float,
@@ -538,33 +575,63 @@ if HAS_TLE_GDN2:
             if K > 64:
                 if STATE_V_FIRST:
                     p_h0_2 = tl.make_block_ptr(
-                        h0 + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+                        h0 + i_nh * K * V,
+                        (V, K),
+                        (K, 1),
+                        (i_v * BV, 64),
+                        (BV, 64),
+                        (1, 0),
                     )
                 else:
                     p_h0_2 = tl.make_block_ptr(
-                        h0 + i_nh * K * V, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
+                        h0 + i_nh * K * V,
+                        (K, V),
+                        (V, 1),
+                        (64, i_v * BV),
+                        (64, BV),
+                        (1, 0),
                     )
                 b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
 
             if K > 128:
                 if STATE_V_FIRST:
                     p_h0_3 = tl.make_block_ptr(
-                        h0 + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
+                        h0 + i_nh * K * V,
+                        (V, K),
+                        (K, 1),
+                        (i_v * BV, 128),
+                        (BV, 64),
+                        (1, 0),
                     )
                 else:
                     p_h0_3 = tl.make_block_ptr(
-                        h0 + i_nh * K * V, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
+                        h0 + i_nh * K * V,
+                        (K, V),
+                        (V, 1),
+                        (128, i_v * BV),
+                        (64, BV),
+                        (1, 0),
                     )
                 b_h3 += tl.load(p_h0_3, boundary_check=(0, 1)).to(tl.float32)
 
             if K > 192:
                 if STATE_V_FIRST:
                     p_h0_4 = tl.make_block_ptr(
-                        h0 + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
+                        h0 + i_nh * K * V,
+                        (V, K),
+                        (K, 1),
+                        (i_v * BV, 192),
+                        (BV, 64),
+                        (1, 0),
                     )
                 else:
                     p_h0_4 = tl.make_block_ptr(
-                        h0 + i_nh * K * V, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
+                        h0 + i_nh * K * V,
+                        (K, V),
+                        (V, 1),
+                        (192, i_v * BV),
+                        (64, BV),
+                        (1, 0),
                     )
                 b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
 
@@ -577,49 +644,97 @@ if HAS_TLE_GDN2:
                 i_t64 = i_t.to(tl.int64)
                 if STATE_V_FIRST:
                     p_h1 = tl.make_block_ptr(
-                        h + i_t64 * H * K * V, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
+                        h + i_t64 * H * K * V,
+                        (V, K),
+                        (K, 1),
+                        (i_v * BV, 0),
+                        (BV, 64),
+                        (1, 0),
                     )
                 else:
                     p_h1 = tl.make_block_ptr(
-                        h + i_t64 * H * K * V, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
+                        h + i_t64 * H * K * V,
+                        (K, V),
+                        (V, 1),
+                        (0, i_v * BV),
+                        (64, BV),
+                        (1, 0),
                     )
                 tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
 
                 if K > 64:
                     if STATE_V_FIRST:
                         p_h2 = tl.make_block_ptr(
-                            h + i_t64 * H * K * V, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+                            h + i_t64 * H * K * V,
+                            (V, K),
+                            (K, 1),
+                            (i_v * BV, 64),
+                            (BV, 64),
+                            (1, 0),
                         )
                     else:
                         p_h2 = tl.make_block_ptr(
-                            h + i_t64 * H * K * V, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
+                            h + i_t64 * H * K * V,
+                            (K, V),
+                            (V, 1),
+                            (64, i_v * BV),
+                            (64, BV),
+                            (1, 0),
                         )
-                    tl.store(p_h2, b_h2.to(p_h2.dtype.element_ty), boundary_check=(0, 1))
+                    tl.store(
+                        p_h2, b_h2.to(p_h2.dtype.element_ty), boundary_check=(0, 1)
+                    )
 
                 if K > 128:
                     if STATE_V_FIRST:
                         p_h3 = tl.make_block_ptr(
-                            h + i_t64 * H * K * V, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
+                            h + i_t64 * H * K * V,
+                            (V, K),
+                            (K, 1),
+                            (i_v * BV, 128),
+                            (BV, 64),
+                            (1, 0),
                         )
                     else:
                         p_h3 = tl.make_block_ptr(
-                            h + i_t64 * H * K * V, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
+                            h + i_t64 * H * K * V,
+                            (K, V),
+                            (V, 1),
+                            (128, i_v * BV),
+                            (64, BV),
+                            (1, 0),
                         )
-                    tl.store(p_h3, b_h3.to(p_h3.dtype.element_ty), boundary_check=(0, 1))
+                    tl.store(
+                        p_h3, b_h3.to(p_h3.dtype.element_ty), boundary_check=(0, 1)
+                    )
 
                 if K > 192:
                     if STATE_V_FIRST:
                         p_h4 = tl.make_block_ptr(
-                            h + i_t64 * H * K * V, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
+                            h + i_t64 * H * K * V,
+                            (V, K),
+                            (K, 1),
+                            (i_v * BV, 192),
+                            (BV, 64),
+                            (1, 0),
                         )
                     else:
                         p_h4 = tl.make_block_ptr(
-                            h + i_t64 * H * K * V, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
+                            h + i_t64 * H * K * V,
+                            (K, V),
+                            (V, 1),
+                            (192, i_v * BV),
+                            (64, BV),
+                            (1, 0),
                         )
-                    tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
+                    tl.store(
+                        p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1)
+                    )
 
             # v_new = u_wy - w_wy @ h
-            p_w = tl.make_block_ptr(w_wy, (T, K), (H * K, 1), (i_t * BT, 0), (BT, 64), (1, 0))
+            p_w = tl.make_block_ptr(
+                w_wy, (T, K), (H * K, 1), (i_t * BT, 0), (BT, 64), (1, 0)
+            )
             b_w_blk = tl.load(p_w, boundary_check=(0, 1))
             if STATE_V_FIRST:
                 b_v_new = tl.dot(b_w_blk, tl.trans(b_h1).to(b_w_blk.dtype))
@@ -627,7 +742,9 @@ if HAS_TLE_GDN2:
                 b_v_new = tl.dot(b_w_blk, b_h1.to(b_w_blk.dtype))
 
             if K > 64:
-                p_w = tl.make_block_ptr(w_wy, (T, K), (H * K, 1), (i_t * BT, 64), (BT, 64), (1, 0))
+                p_w = tl.make_block_ptr(
+                    w_wy, (T, K), (H * K, 1), (i_t * BT, 64), (BT, 64), (1, 0)
+                )
                 b_w_blk = tl.load(p_w, boundary_check=(0, 1))
                 if STATE_V_FIRST:
                     b_v_new += tl.dot(b_w_blk, tl.trans(b_h2).to(b_w_blk.dtype))
@@ -635,7 +752,9 @@ if HAS_TLE_GDN2:
                     b_v_new += tl.dot(b_w_blk, b_h2.to(b_w_blk.dtype))
 
             if K > 128:
-                p_w = tl.make_block_ptr(w_wy, (T, K), (H * K, 1), (i_t * BT, 128), (BT, 64), (1, 0))
+                p_w = tl.make_block_ptr(
+                    w_wy, (T, K), (H * K, 1), (i_t * BT, 128), (BT, 64), (1, 0)
+                )
                 b_w_blk = tl.load(p_w, boundary_check=(0, 1))
                 if STATE_V_FIRST:
                     b_v_new += tl.dot(b_w_blk, tl.trans(b_h3).to(b_w_blk.dtype))
@@ -643,18 +762,24 @@ if HAS_TLE_GDN2:
                     b_v_new += tl.dot(b_w_blk, b_h3.to(b_w_blk.dtype))
 
             if K > 192:
-                p_w = tl.make_block_ptr(w_wy, (T, K), (H * K, 1), (i_t * BT, 192), (BT, 64), (1, 0))
+                p_w = tl.make_block_ptr(
+                    w_wy, (T, K), (H * K, 1), (i_t * BT, 192), (BT, 64), (1, 0)
+                )
                 b_w_blk = tl.load(p_w, boundary_check=(0, 1))
                 if STATE_V_FIRST:
                     b_v_new += tl.dot(b_w_blk, tl.trans(b_h4).to(b_w_blk.dtype))
                 else:
                     b_v_new += tl.dot(b_w_blk, b_h4.to(b_w_blk.dtype))
 
-            p_u = tl.make_block_ptr(u_wy, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+            p_u = tl.make_block_ptr(
+                u_wy, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+            )
             b_v_new = tl.load(p_u, boundary_check=(0, 1)) - b_v_new
 
             # o = scale * qg @ h + Aqk @ v_new
-            p_qg = tl.make_block_ptr(qg, (T, K), (H * K, 1), (i_t * BT, 0), (BT, 64), (1, 0))
+            p_qg = tl.make_block_ptr(
+                qg, (T, K), (H * K, 1), (i_t * BT, 0), (BT, 64), (1, 0)
+            )
             b_qg_blk = tl.load(p_qg, boundary_check=(0, 1))
             if STATE_V_FIRST:
                 b_o = tl.dot(b_qg_blk, tl.trans(b_h1).to(b_qg_blk.dtype))
@@ -662,7 +787,9 @@ if HAS_TLE_GDN2:
                 b_o = tl.dot(b_qg_blk, b_h1.to(b_qg_blk.dtype))
 
             if K > 64:
-                p_qg = tl.make_block_ptr(qg, (T, K), (H * K, 1), (i_t * BT, 64), (BT, 64), (1, 0))
+                p_qg = tl.make_block_ptr(
+                    qg, (T, K), (H * K, 1), (i_t * BT, 64), (BT, 64), (1, 0)
+                )
                 b_qg_blk = tl.load(p_qg, boundary_check=(0, 1))
                 if STATE_V_FIRST:
                     b_o += tl.dot(b_qg_blk, tl.trans(b_h2).to(b_qg_blk.dtype))
@@ -670,7 +797,9 @@ if HAS_TLE_GDN2:
                     b_o += tl.dot(b_qg_blk, b_h2.to(b_qg_blk.dtype))
 
             if K > 128:
-                p_qg = tl.make_block_ptr(qg, (T, K), (H * K, 1), (i_t * BT, 128), (BT, 64), (1, 0))
+                p_qg = tl.make_block_ptr(
+                    qg, (T, K), (H * K, 1), (i_t * BT, 128), (BT, 64), (1, 0)
+                )
                 b_qg_blk = tl.load(p_qg, boundary_check=(0, 1))
                 if STATE_V_FIRST:
                     b_o += tl.dot(b_qg_blk, tl.trans(b_h3).to(b_qg_blk.dtype))
@@ -678,7 +807,9 @@ if HAS_TLE_GDN2:
                     b_o += tl.dot(b_qg_blk, b_h3.to(b_qg_blk.dtype))
 
             if K > 192:
-                p_qg = tl.make_block_ptr(qg, (T, K), (H * K, 1), (i_t * BT, 192), (BT, 64), (1, 0))
+                p_qg = tl.make_block_ptr(
+                    qg, (T, K), (H * K, 1), (i_t * BT, 192), (BT, 64), (1, 0)
+                )
                 b_qg_blk = tl.load(p_qg, boundary_check=(0, 1))
                 if STATE_V_FIRST:
                     b_o += tl.dot(b_qg_blk, tl.trans(b_h4).to(b_qg_blk.dtype))
@@ -686,17 +817,23 @@ if HAS_TLE_GDN2:
                     b_o += tl.dot(b_qg_blk, b_h4.to(b_qg_blk.dtype))
 
             b_o *= scale
-            p_Aqk = tl.make_block_ptr(Aqk, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+            p_Aqk = tl.make_block_ptr(
+                Aqk, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
+            )
             b_Aqk = tl.load(p_Aqk, boundary_check=(0, 1))
             b_o += tl.dot(b_Aqk.to(b_v_new.dtype), b_v_new)
 
-            p_o = tl.make_block_ptr(o, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+            p_o = tl.make_block_ptr(
+                o, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+            )
             tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
             # State decay: h *= exp2(g_last) per K channel.
             last_idx = tl.minimum(i_t * BT + BT, T) - 1
             o_k = tl.arange(0, 64)
-            b_g_last1 = tl.load(gk + last_idx * H * K + o_k, mask=o_k < K, other=0.0).to(tl.float32)
+            b_g_last1 = tl.load(
+                gk + last_idx * H * K + o_k, mask=o_k < K, other=0.0
+            ).to(tl.float32)
             if STATE_V_FIRST:
                 b_h1 *= exp2(b_g_last1)[None, :]
             else:
@@ -704,7 +841,9 @@ if HAS_TLE_GDN2:
 
             if K > 64:
                 o_k2 = 64 + o_k
-                b_g_last2 = tl.load(gk + last_idx * H * K + o_k2, mask=o_k2 < K, other=0.0).to(tl.float32)
+                b_g_last2 = tl.load(
+                    gk + last_idx * H * K + o_k2, mask=o_k2 < K, other=0.0
+                ).to(tl.float32)
                 if STATE_V_FIRST:
                     b_h2 *= exp2(b_g_last2)[None, :]
                 else:
@@ -712,7 +851,9 @@ if HAS_TLE_GDN2:
 
             if K > 128:
                 o_k3 = 128 + o_k
-                b_g_last3 = tl.load(gk + last_idx * H * K + o_k3, mask=o_k3 < K, other=0.0).to(tl.float32)
+                b_g_last3 = tl.load(
+                    gk + last_idx * H * K + o_k3, mask=o_k3 < K, other=0.0
+                ).to(tl.float32)
                 if STATE_V_FIRST:
                     b_h3 *= exp2(b_g_last3)[None, :]
                 else:
@@ -720,7 +861,9 @@ if HAS_TLE_GDN2:
 
             if K > 192:
                 o_k4 = 192 + o_k
-                b_g_last4 = tl.load(gk + last_idx * H * K + o_k4, mask=o_k4 < K, other=0.0).to(tl.float32)
+                b_g_last4 = tl.load(
+                    gk + last_idx * H * K + o_k4, mask=o_k4 < K, other=0.0
+                ).to(tl.float32)
                 if STATE_V_FIRST:
                     b_h4 *= exp2(b_g_last4)[None, :]
                 else:
@@ -729,7 +872,9 @@ if HAS_TLE_GDN2:
             # State update: h += kg^T @ v_new.  The GDN-2 write gate has already
             # been folded into u_wy and therefore into v_new.
             b_v_cast = b_v_new.to(kg.dtype.element_ty)
-            p_kg = tl.make_block_ptr(kg, (K, T), (1, H * K), (0, i_t * BT), (64, BT), (0, 1))
+            p_kg = tl.make_block_ptr(
+                kg, (K, T), (1, H * K), (0, i_t * BT), (64, BT), (0, 1)
+            )
             b_kg_blk = tl.load(p_kg, boundary_check=(0, 1))
             if STATE_V_FIRST:
                 b_h1 += tl.trans(tl.dot(b_kg_blk, b_v_cast))
@@ -737,7 +882,9 @@ if HAS_TLE_GDN2:
                 b_h1 += tl.dot(b_kg_blk, b_v_cast)
 
             if K > 64:
-                p_kg = tl.make_block_ptr(kg, (K, T), (1, H * K), (64, i_t * BT), (64, BT), (0, 1))
+                p_kg = tl.make_block_ptr(
+                    kg, (K, T), (1, H * K), (64, i_t * BT), (64, BT), (0, 1)
+                )
                 b_kg_blk = tl.load(p_kg, boundary_check=(0, 1))
                 if STATE_V_FIRST:
                     b_h2 += tl.trans(tl.dot(b_kg_blk, b_v_cast))
@@ -745,7 +892,9 @@ if HAS_TLE_GDN2:
                     b_h2 += tl.dot(b_kg_blk, b_v_cast)
 
             if K > 128:
-                p_kg = tl.make_block_ptr(kg, (K, T), (1, H * K), (128, i_t * BT), (64, BT), (0, 1))
+                p_kg = tl.make_block_ptr(
+                    kg, (K, T), (1, H * K), (128, i_t * BT), (64, BT), (0, 1)
+                )
                 b_kg_blk = tl.load(p_kg, boundary_check=(0, 1))
                 if STATE_V_FIRST:
                     b_h3 += tl.trans(tl.dot(b_kg_blk, b_v_cast))
@@ -753,7 +902,9 @@ if HAS_TLE_GDN2:
                     b_h3 += tl.dot(b_kg_blk, b_v_cast)
 
             if K > 192:
-                p_kg = tl.make_block_ptr(kg, (K, T), (1, H * K), (192, i_t * BT), (64, BT), (0, 1))
+                p_kg = tl.make_block_ptr(
+                    kg, (K, T), (1, H * K), (192, i_t * BT), (64, BT), (0, 1)
+                )
                 b_kg_blk = tl.load(p_kg, boundary_check=(0, 1))
                 if STATE_V_FIRST:
                     b_h4 += tl.trans(tl.dot(b_kg_blk, b_v_cast))
@@ -774,36 +925,65 @@ if HAS_TLE_GDN2:
             if K > 64:
                 if STATE_V_FIRST:
                     p_ht = tl.make_block_ptr(
-                        ht + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+                        ht + i_nh * K * V,
+                        (V, K),
+                        (K, 1),
+                        (i_v * BV, 64),
+                        (BV, 64),
+                        (1, 0),
                     )
                 else:
                     p_ht = tl.make_block_ptr(
-                        ht + i_nh * K * V, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
+                        ht + i_nh * K * V,
+                        (K, V),
+                        (V, 1),
+                        (64, i_v * BV),
+                        (64, BV),
+                        (1, 0),
                     )
                 tl.store(p_ht, b_h2.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
             if K > 128:
                 if STATE_V_FIRST:
                     p_ht = tl.make_block_ptr(
-                        ht + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
+                        ht + i_nh * K * V,
+                        (V, K),
+                        (K, 1),
+                        (i_v * BV, 128),
+                        (BV, 64),
+                        (1, 0),
                     )
                 else:
                     p_ht = tl.make_block_ptr(
-                        ht + i_nh * K * V, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
+                        ht + i_nh * K * V,
+                        (K, V),
+                        (V, 1),
+                        (128, i_v * BV),
+                        (64, BV),
+                        (1, 0),
                     )
                 tl.store(p_ht, b_h3.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
             if K > 192:
                 if STATE_V_FIRST:
                     p_ht = tl.make_block_ptr(
-                        ht + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
+                        ht + i_nh * K * V,
+                        (V, K),
+                        (K, 1),
+                        (i_v * BV, 192),
+                        (BV, 64),
+                        (1, 0),
                     )
                 else:
                     p_ht = tl.make_block_ptr(
-                        ht + i_nh * K * V, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
+                        ht + i_nh * K * V,
+                        (K, V),
+                        (V, 1),
+                        (192, i_v * BV),
+                        (64, BV),
+                        (1, 0),
                     )
                 tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
-
 
     def chunk_gdn2_fwd_h_o_infer(
         kg: torch.Tensor,
@@ -820,14 +1000,19 @@ if HAS_TLE_GDN2:
         cu_seqlens: torch.LongTensor | None = None,
         chunk_indices: torch.LongTensor | None = None,
         chunk_size: int = 16,
-    ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor | None]
+        | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]
+    ):
         """Fused GDN-2 state propagation + output for BT=16 inference."""
         B, T, H, K = kg.shape
         V = u_wy.shape[-1]
         BT = chunk_size
 
         if BT != 16:
-            raise ValueError(f"Flash-style GDN-2 fused inference requires chunk_size=16, got {BT}.")
+            raise ValueError(
+                f"Flash-style GDN-2 fused inference requires chunk_size=16, got {BT}."
+            )
 
         if cu_seqlens is None:
             N = B
@@ -888,7 +1073,6 @@ if HAS_TLE_GDN2:
             return o, final_state, h
         return o, final_state
 
-
     def chunk_gdn2_fwd_infer(
         q: torch.Tensor,
         k: torch.Tensor,
@@ -912,9 +1096,12 @@ if HAS_TLE_GDN2:
         state_v_first: bool = False,
         A_log: torch.Tensor | None = None,
         dt_bias: torch.Tensor | None = None,
-        cp_context: "FLACPContext | None" = None,
+        cp_context: "None" = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor | None]
+        | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]
+    ):
         """FlashKDA-style fused inference forward for GDN-2.
 
         Args follow ``fla.ops.gdn2.chunk_gdn2`` where possible.
@@ -928,30 +1115,42 @@ if HAS_TLE_GDN2:
         is selected by passing ``lower_bound`` with ``use_gate_in_kernel=True``.
         """
         if cp_context is not None:
-            raise NotImplementedError("chunk_gdn2_fwd_infer currently does not support context parallelism.")
+            raise NotImplementedError(
+                "chunk_gdn2_fwd_infer currently does not support context parallelism."
+            )
         if disable_recompute:
             # Kept for signature compatibility; inference does not use recompute.
             pass
         if chunk_size != 16:
-            raise ValueError(f"Flash-style GDN-2 fused inference requires chunk_size=16, got {chunk_size}.")
+            raise ValueError(
+                f"Flash-style GDN-2 fused inference requires chunk_size=16, got {chunk_size}."
+            )
         if q.shape != k.shape or q.shape != g.shape or q.shape != b.shape:
             raise ValueError(
                 f"q, k, g, b must all have shape [B,T,H,K]; got "
                 f"q={tuple(q.shape)}, k={tuple(k.shape)}, g={tuple(g.shape)}, b={tuple(b.shape)}."
             )
         if v.shape != w.shape:
-            raise ValueError(f"v and w must both have shape [B,T,H,V]; got v={tuple(v.shape)}, w={tuple(w.shape)}.")
+            raise ValueError(
+                f"v and w must both have shape [B,T,H,V]; got v={tuple(v.shape)}, w={tuple(w.shape)}."
+            )
         if q.shape[:3] != v.shape[:3]:
-            raise ValueError(f"q/k/g/b and v/w must match on [B,T,H]; got q={tuple(q.shape)}, v={tuple(v.shape)}.")
+            raise ValueError(
+                f"q/k/g/b and v/w must match on [B,T,H]; got q={tuple(q.shape)}, v={tuple(v.shape)}."
+            )
         if q.shape[-1] > 256:
-            raise ValueError(f"GDN-2 fused inference supports K <= 256, got K={q.shape[-1]}.")
+            raise ValueError(
+                f"GDN-2 fused inference supports K <= 256, got K={q.shape[-1]}."
+            )
         if initial_state is not None and initial_state.dtype != torch.float32:
             raise ValueError("initial_state must be float32.")
         if use_gate_in_kernel and A_log is None:
             raise ValueError("A_log must be provided when use_gate_in_kernel=True.")
         if safe_gate and use_gate_in_kernel:
             if lower_bound is None:
-                raise ValueError("lower_bound must be set when safe_gate=True and use_gate_in_kernel=True.")
+                raise ValueError(
+                    "lower_bound must be set when safe_gate=True and use_gate_in_kernel=True."
+                )
             if not (-5 <= lower_bound < 0):
                 raise ValueError(f"lower_bound must be in [-5, 0), got {lower_bound}.")
 
@@ -995,8 +1194,6 @@ if HAS_TLE_GDN2:
             chunk_indices=chunk_indices,
             chunk_size=chunk_size,
         )
-
-
 
 
 # 4. 唯一公开入口
