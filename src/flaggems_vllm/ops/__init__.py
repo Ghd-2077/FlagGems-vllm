@@ -1,6 +1,8 @@
 # isort: off
+from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
+from flaggems_vllm.ops.beam_search_score import beam_search_score, beam_search_score_
 from flaggems_vllm.ops.bincount import bincount
 from flaggems_vllm.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
 from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla
@@ -34,6 +36,8 @@ from flaggems_vllm.ops.attention import (
 from flaggems_vllm.ops.flash_mla import flash_mla
 from flaggems_vllm.ops.flash_mla_with_kvcache import flash_mla_with_kvcache
 from flaggems_vllm.ops.flashmla_sparse import flash_mla_sparse_fwd
+from flaggems_vllm.ops.fp8_fp4_mqa_logits import fp8_fp4_mqa_logits
+from flaggems_vllm.ops.fp8_fp4_paged_mqa_logits import fp8_fp4_paged_mqa_logits
 from flaggems_vllm.ops.fused_add_rms_norm import fused_add_rms_norm
 from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
@@ -66,6 +70,7 @@ from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size_triton,
 )
 from flaggems_vllm.ops.moe_sum import moe_sum
+from flaggems_vllm.ops.mrope import mrope
 from flaggems_vllm.ops.mul import mul, mul_
 from flaggems_vllm.ops.mv import mv
 from flaggems_vllm.ops.outer import outer
@@ -82,6 +87,7 @@ from flaggems_vllm.ops.reglu import dreglu, reglu
 from flaggems_vllm.ops.reshape_and_cache import reshape_and_cache
 from flaggems_vllm.ops.reshape_and_cache_flash import reshape_and_cache_flash
 from flaggems_vllm.ops.rotary_embedding import apply_rotary_pos_emb
+from flaggems_vllm.ops.router_gemm import router_gemm
 from flaggems_vllm.ops.rwkv_ka_fusion import rwkv_ka_fusion
 from flaggems_vllm.ops.rwkv_mm_sparsity import rwkv_mm_sparsity
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul, silu_and_mul_out
@@ -99,6 +105,7 @@ from flaggems_vllm.ops.top_k_per_row_decode import top_k_per_row_decode
 from flaggems_vllm.ops.top_k_per_row_prefill import top_k_per_row_prefill
 from flaggems_vllm.ops.topk_softmax import topk_softmax
 from flaggems_vllm.ops.topk_softplus_sqrt import topk_softplus_sqrt
+from flaggems_vllm.ops.triton_unified_attention import triton_unified_attention
 from flaggems_vllm.ops.unpack_seq import unpack_seq_triton
 from flaggems_vllm.ops.weightnorm import (
     weight_norm_interface,
@@ -109,9 +116,12 @@ from flaggems_vllm.ops.weight_norm import weight_norm
 # isort: on
 
 __all__ = [
+    "act_quant_triton",
     "add_rms_norm",
     "apply_repetition_penalties",
     "apply_rotary_pos_emb",
+    "beam_search_score",
+    "beam_search_score_",
     "bincount",
     "bucket_sort_topk",
     "chunk_gated_delta_rule",
@@ -133,6 +143,8 @@ __all__ = [
     "flash_mla",
     "flash_mla_sparse_fwd",
     "flash_mla_with_kvcache",
+    "fp8_fp4_mqa_logits",
+    "fp8_fp4_paged_mqa_logits",
     "fused_add_rms_norm",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
@@ -156,6 +168,7 @@ __all__ = [
     "moe_align_block_size",
     "moe_align_block_size_triton",
     "moe_sum",
+    "mrope",
     "mul",
     "mul_",
     "mv",
@@ -168,6 +181,7 @@ __all__ = [
     "reglu",
     "reshape_and_cache",
     "reshape_and_cache_flash",
+    "router_gemm",
     "rwkv_ka_fusion",
     "rwkv_mm_sparsity",
     "silu_and_mul",
@@ -184,6 +198,7 @@ __all__ = [
     "top_k_per_row_prefill",
     "topk_softmax",
     "topk_softplus_sqrt",
+    "triton_unified_attention",
     "unpack_seq_triton",
     "weight_norm",
     "weight_norm_interface",
