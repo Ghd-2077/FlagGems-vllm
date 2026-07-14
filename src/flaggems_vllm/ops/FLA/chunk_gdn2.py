@@ -474,24 +474,75 @@ if HAS_TLE_GDN2:
     # K2: fused state propagation + output, sequential over chunks per (batch, head, V-tile)
     # =============================================================================
 
-    @triton.heuristics(
-        {
-            "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
-            "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
-            "STORE_H": lambda args: args["h"] is not None,
-            "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        }
-    )
-    @triton.autotune(
-        configs=[
-            triton.Config({"BV": BV}, num_warps=num_warps)
-            for BV in [32, 64]
-            for num_warps in [2, 4]
-        ],
-        key=["H", "K", "V", "BT"],
-    )
     @triton.jit(do_not_specialize=["T"])
-    def _chunk_gdn2_fwd_h_o_infer_kernel(
+    def _chunk_gdn2_fwd_h_o_g_last_producer(
+        g_last_writer,
+        gk,
+        cu_seqlens,
+        chunk_offsets,
+        T,
+        H: tl.constexpr,
+        K: tl.constexpr,
+        BT: tl.constexpr,
+        IS_VARLEN: tl.constexpr,
+    ):
+        i_nh = tl.program_id(1)
+
+        if IS_VARLEN:
+            i_n = i_nh // H
+            i_h = i_nh % H
+            bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+            eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+            T = eos - bos
+            NT = tl.cdiv(T, BT)
+        else:
+            i_n = i_nh // H
+            i_h = i_nh % H
+            bos = i_n * T
+            NT = tl.cdiv(T, BT)
+
+        gk += (bos * H + i_h).to(tl.int64) * K
+        o_k = tl.arange(0, 64)
+        g_row0 = tl.full((64,), 0, dtype=tl.int32)
+        g_row1 = tl.full((64,), 1, dtype=tl.int32)
+        g_row2 = tl.full((64,), 2, dtype=tl.int32)
+        g_row3 = tl.full((64,), 3, dtype=tl.int32)
+
+        for i_t in range(NT):
+            last_idx = tl.minimum(i_t * BT + BT, T) - 1
+            g_last_slot = g_last_writer.acquire(i_t)
+
+            b_g_last1 = tl.load(
+                gk + last_idx * H * K + o_k, mask=o_k < K, other=0.0
+            ).to(tl.float32)
+            tl.store(tle.gpu.local_ptr(g_last_slot.g, (g_row0, o_k)), b_g_last1)
+
+            if K > 64:
+                o_k2 = 64 + o_k
+                b_g_last2 = tl.load(
+                    gk + last_idx * H * K + o_k2, mask=o_k2 < K, other=0.0
+                ).to(tl.float32)
+                tl.store(tle.gpu.local_ptr(g_last_slot.g, (g_row1, o_k)), b_g_last2)
+
+            if K > 128:
+                o_k3 = 128 + o_k
+                b_g_last3 = tl.load(
+                    gk + last_idx * H * K + o_k3, mask=o_k3 < K, other=0.0
+                ).to(tl.float32)
+                tl.store(tle.gpu.local_ptr(g_last_slot.g, (g_row2, o_k)), b_g_last3)
+
+            if K > 192:
+                o_k4 = 192 + o_k
+                b_g_last4 = tl.load(
+                    gk + last_idx * H * K + o_k4, mask=o_k4 < K, other=0.0
+                ).to(tl.float32)
+                tl.store(tle.gpu.local_ptr(g_last_slot.g, (g_row3, o_k)), b_g_last4)
+
+            g_last_writer.commit(i_t)
+
+    @triton.jit(do_not_specialize=["T"])
+    def _chunk_gdn2_fwd_h_o_infer_consumer(
+        g_last_reader,
         kg,  # [B, T, H, K]
         w_wy,  # [B, T, H, K]
         u_wy,  # [B, T, H, V]
@@ -828,46 +879,51 @@ if HAS_TLE_GDN2:
             )
             tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
-            # State decay: h *= exp2(g_last) per K channel.
-            last_idx = tl.minimum(i_t * BT + BT, T) - 1
+            # State decay: consume g_last staged by the producer worker through shared-memory pipe.
             o_k = tl.arange(0, 64)
-            b_g_last1 = tl.load(
-                gk + last_idx * H * K + o_k, mask=o_k < K, other=0.0
-            ).to(tl.float32)
+            g_row0 = tl.full((64,), 0, dtype=tl.int32)
+            g_row1 = tl.full((64,), 1, dtype=tl.int32)
+            g_row2 = tl.full((64,), 2, dtype=tl.int32)
+            g_row3 = tl.full((64,), 3, dtype=tl.int32)
+            g_last_wait = g_last_reader.wait(i_t)
+            g_last_slot = g_last_wait.slot
+
+            b_g_last1 = tl.load(tle.gpu.local_ptr(g_last_slot.g, (g_row0, o_k))).to(
+                tl.float32
+            )
             if STATE_V_FIRST:
                 b_h1 *= exp2(b_g_last1)[None, :]
             else:
                 b_h1 *= exp2(b_g_last1)[:, None]
 
             if K > 64:
-                o_k2 = 64 + o_k
-                b_g_last2 = tl.load(
-                    gk + last_idx * H * K + o_k2, mask=o_k2 < K, other=0.0
-                ).to(tl.float32)
+                b_g_last2 = tl.load(tle.gpu.local_ptr(g_last_slot.g, (g_row1, o_k))).to(
+                    tl.float32
+                )
                 if STATE_V_FIRST:
                     b_h2 *= exp2(b_g_last2)[None, :]
                 else:
                     b_h2 *= exp2(b_g_last2)[:, None]
 
             if K > 128:
-                o_k3 = 128 + o_k
-                b_g_last3 = tl.load(
-                    gk + last_idx * H * K + o_k3, mask=o_k3 < K, other=0.0
-                ).to(tl.float32)
+                b_g_last3 = tl.load(tle.gpu.local_ptr(g_last_slot.g, (g_row2, o_k))).to(
+                    tl.float32
+                )
                 if STATE_V_FIRST:
                     b_h3 *= exp2(b_g_last3)[None, :]
                 else:
                     b_h3 *= exp2(b_g_last3)[:, None]
 
             if K > 192:
-                o_k4 = 192 + o_k
-                b_g_last4 = tl.load(
-                    gk + last_idx * H * K + o_k4, mask=o_k4 < K, other=0.0
-                ).to(tl.float32)
+                b_g_last4 = tl.load(tle.gpu.local_ptr(g_last_slot.g, (g_row3, o_k))).to(
+                    tl.float32
+                )
                 if STATE_V_FIRST:
                     b_h4 *= exp2(b_g_last4)[None, :]
                 else:
                     b_h4 *= exp2(b_g_last4)[:, None]
+
+            g_last_reader.release(i_t)
 
             # State update: h += kg^T @ v_new.  The GDN-2 write gate has already
             # been folded into u_wy and therefore into v_new.
@@ -984,6 +1040,133 @@ if HAS_TLE_GDN2:
                         (1, 0),
                     )
                 tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+
+    @triton.heuristics(
+        {
+            "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
+            "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
+            "STORE_H": lambda args: args["h"] is not None,
+            "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        }
+    )
+    @triton.autotune(
+        configs=[
+            triton.Config({"BV": BV}, num_warps=num_warps)
+            for BV in [16, 32, 64]
+            for num_warps in [4]
+        ],
+        key=["H", "K", "V", "BT"],
+    )
+    @triton.jit(do_not_specialize=["T"])
+    def _chunk_gdn2_fwd_h_o_infer_kernel(
+        kg,  # [B, T, H, K]
+        w_wy,  # [B, T, H, K]
+        u_wy,  # [B, T, H, V]
+        gk,  # [B, T, H, K] base-2 local cumsum
+        qg,  # [B, T, H, K]
+        Aqk,  # [B, T, H, BT]
+        o,  # [B, T, H, V]
+        h,  # optional [N, NT, H, K, V] or [N, NT, H, V, K]
+        h0,  # optional initial state
+        ht,  # optional final state
+        cu_seqlens,
+        chunk_offsets,
+        scale: float,
+        T,
+        H: tl.constexpr,
+        K: tl.constexpr,
+        V: tl.constexpr,
+        BT: tl.constexpr,
+        BV: tl.constexpr,
+        STATE_V_FIRST: tl.constexpr,
+        USE_INITIAL_STATE: tl.constexpr,
+        STORE_FINAL_STATE: tl.constexpr,
+        STORE_H: tl.constexpr,
+        IS_VARLEN: tl.constexpr,
+    ):
+        g_last_smem = tle.gpu.alloc(
+            [1, 4, 64],
+            dtype=tl.float32,
+            layout=None,
+            scope=tle.gpu.smem,
+            nv_mma_shared_layout=False,
+        )
+        g_last_pipe = tle.pipe(
+            capacity=1,
+            scope="cta",
+            name="gdn2_k2_g_last",
+            g=g_last_smem,
+        )
+
+        if STORE_H:
+            h_worker = h
+        else:
+            h_worker = gk
+        if USE_INITIAL_STATE:
+            h0_worker = h0
+        else:
+            h0_worker = gk
+        if STORE_FINAL_STATE:
+            ht_worker = ht
+        else:
+            ht_worker = gk
+        if IS_VARLEN:
+            cu_worker = cu_seqlens
+            offsets_worker = chunk_offsets
+        else:
+            cu_worker = gk
+            offsets_worker = gk
+
+        tle.gpu.warp_specialize(
+            [
+                (
+                    _chunk_gdn2_fwd_h_o_infer_consumer,
+                    (
+                        g_last_pipe.reader(),
+                        kg,
+                        w_wy,
+                        u_wy,
+                        gk,
+                        qg,
+                        Aqk,
+                        o,
+                        h_worker,
+                        h0_worker,
+                        ht_worker,
+                        cu_worker,
+                        offsets_worker,
+                        scale,
+                        T,
+                        H,
+                        K,
+                        V,
+                        BT,
+                        BV,
+                        STATE_V_FIRST,
+                        USE_INITIAL_STATE,
+                        STORE_FINAL_STATE,
+                        STORE_H,
+                        IS_VARLEN,
+                    ),
+                ),
+                (
+                    _chunk_gdn2_fwd_h_o_g_last_producer,
+                    (
+                        g_last_pipe.writer(),
+                        gk,
+                        cu_worker,
+                        offsets_worker,
+                        T,
+                        H,
+                        K,
+                        BT,
+                        IS_VARLEN,
+                    ),
+                ),
+            ],
+            [1],
+            [32],
+        )
 
     def chunk_gdn2_fwd_h_o_infer(
         kg: torch.Tensor,
